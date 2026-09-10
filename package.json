@@ -1,0 +1,16 @@
+{
+  "name": "vt-discord-bot",
+  "version": "1.0.0",
+  "description": "Bot de Discord que analiza links y archivos con VirusTotal",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "form-data": "^4.0.1"
+  }
+}
