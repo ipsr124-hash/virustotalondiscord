@@ -7,6 +7,28 @@ const express = require('express');
 const VT_API_KEY = process.env.VT_API_KEY;
 const VT_BASE = 'https://www.virustotal.com/api/v3';
 
+// ---------- Configuración de canales ----------
+// Canales donde TODOS los mensajes (de usuarios y del propio bot) se
+// autodestruyen a los 2 minutos de haberse enviado.
+const AUTO_DELETE_CHANNEL_IDS = ['1547651139254886400', '1546538254386335865'];
+const AUTO_DELETE_DELAY_MS = 2 * 60 * 1000; // 2 minutos
+
+// Único canal en el que el bot escanea automáticamente los archivos
+// adjuntos que se suben en mensajes normales. El comando /scanurl sigue
+// funcionando en cualquier canal.
+const SCAN_FILE_CHANNEL_ID = '1547651139254886400';
+
+// Programa el borrado de un mensaje si su canal está en la lista de
+// autodestrucción. Silencioso si falla (p. ej. si ya fue borrado o si al
+// bot le falta el permiso "Gestionar mensajes").
+function programarAutoBorrado(message) {
+  if (!message || !message.channelId) return;
+  if (!AUTO_DELETE_CHANNEL_IDS.includes(message.channelId)) return;
+  setTimeout(() => {
+    message.delete().catch(() => {});
+  }, AUTO_DELETE_DELAY_MS);
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
@@ -133,16 +155,27 @@ client.on('interactionCreate', async interaction => {
     } catch (err) {
       await interaction.editReply(`Error al analizar: ${err.message}`);
     }
+
+    try {
+      const replyMsg = await interaction.fetchReply();
+      programarAutoBorrado(replyMsg);
+    } catch (e) {}
   }
 });
 
 // Detectar archivos adjuntos en mensajes normales
 client.on('messageCreate', async message => {
+  // Autodestrucción: aplica a CUALQUIER mensaje (de usuario o del bot)
+  // publicado en los canales configurados, tenga o no adjuntos.
+  programarAutoBorrado(message);
+
   if (message.author.bot) return;
   if (message.attachments.size === 0) return;
+  if (message.channelId !== SCAN_FILE_CHANNEL_ID) return; // el escaneo automático de archivos solo corre en este canal
 
   const attachment = message.attachments.first();
   const reply = await message.reply('🔍 Analizando archivo, esto puede tardar unos segundos...');
+  programarAutoBorrado(reply);
 
   try {
     const fileRes = await axios.get(attachment.url, { responseType: 'arraybuffer' });
