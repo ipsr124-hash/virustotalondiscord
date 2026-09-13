@@ -1,5 +1,17 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  PermissionFlagsBits,
+  ChannelType
+} = require('discord.js');
 const axios = require('axios');
 const FormData = require('form-data');
 const express = require('express');
@@ -29,8 +41,208 @@ function programarAutoBorrado(message) {
   }, AUTO_DELETE_DELAY_MS);
 }
 
+// ---------- Configuración del sistema de tickets ----------
+// Opcionales: si no se configuran, los tickets se crean sin categoría y
+// solo puede cerrarlos quien tenga el permiso "Gestionar canales" (además
+// de la persona que abrió el ticket).
+const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || '1546449940149047326';
+const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || '1546539452388614236';
+// Único rol autorizado a usar /clearchat.
+const CLEARCHAT_ROLE_ID = process.env.CLEARCHAT_ROLE_ID || '1323439782155649028';
+
+const TICKET_TYPES = {
+  soporte: {
+    panelChannelId: '1548737731524559018',
+    prefix: 'ticket',
+    label: 'Abrir ticket',
+    emoji: '🎫',
+    title: '🎫 Sistema de tickets',
+    description: 'Si necesitás ayuda o tenés un problema, tocá el botón de abajo para abrir un ticket privado con el staff.',
+    color: 0x2ecc71,
+    bienvenida: 'Gracias por abrir un ticket. Contanos con detalle qué necesitás y el staff te va a responder a la brevedad.'
+  },
+  queja: {
+    panelChannelId: '1548738432350552124',
+    prefix: 'queja',
+    label: 'Abrir queja/sugerencia',
+    emoji: '📝',
+    title: '📝 Quejas y sugerencias',
+    description: 'Si tenés una queja o una sugerencia para mejorar el server, tocá el botón de abajo para abrir un canal privado con el staff.',
+    color: 0xf1c40f,
+    bienvenida: 'Gracias por tu queja/sugerencia. Contanos con detalle de qué se trata y el staff la va a revisar.'
+  }
+};
+
+function esPersonalAutorizado(member) {
+  if (!member) return false;
+  if (member.permissions.has(PermissionFlagsBits.ManageChannels)) return true;
+  if (STAFF_ROLE_ID && member.roles.cache.has(STAFF_ROLE_ID)) return true;
+  return false;
+}
+
+// Publica el panel con botón en cada canal configurado, si todavía no existe
+// (para no duplicarlo cada vez que el bot se reinicia).
+async function asegurarPanelesDeTickets() {
+  for (const [key, cfg] of Object.entries(TICKET_TYPES)) {
+    try {
+      const channel = await client.channels.fetch(cfg.panelChannelId);
+      if (!channel) {
+        console.error(`[TICKETS] No encontré el canal ${cfg.panelChannelId} para el panel de "${key}".`);
+        continue;
+      }
+
+      const mensajes = await channel.messages.fetch({ limit: 20 });
+      const yaExiste = mensajes.some(m => m.author.id === client.user.id && m.embeds[0]?.title === cfg.title);
+      if (yaExiste) continue;
+
+      const embed = new EmbedBuilder()
+        .setTitle(cfg.title)
+        .setDescription(cfg.description)
+        .setColor(cfg.color);
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`open_ticket_${key}`)
+          .setLabel(cfg.label)
+          .setEmoji(cfg.emoji)
+          .setStyle(ButtonStyle.Primary)
+      );
+
+      await channel.send({ embeds: [embed], components: [row] });
+      console.log(`[TICKETS] Panel de "${key}" publicado en #${channel.name}`);
+    } catch (err) {
+      console.error(`[TICKETS] Error preparando el panel de "${key}":`, err.message);
+    }
+  }
+}
+
+async function abrirTicket(interaction, tipoKey) {
+  const cfg = TICKET_TYPES[tipoKey];
+  if (!cfg) return;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const guild = interaction.guild;
+  const topicMarca = `ticket:${tipoKey}:${interaction.user.id}`;
+
+  // Evitar que la misma persona abra dos tickets del mismo tipo a la vez.
+  const existente = guild.channels.cache.find(c => c.topic === topicMarca);
+  if (existente) {
+    await interaction.editReply(`Ya tenés un ticket abierto: ${existente}`);
+    return;
+  }
+
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: interaction.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+    },
+    {
+      id: client.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels]
+    }
+  ];
+  if (STAFF_ROLE_ID) {
+    overwrites.push({
+      id: STAFF_ROLE_ID,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+    });
+  }
+
+  let canal;
+  try {
+    canal = await guild.channels.create({
+      name: `${cfg.prefix}-${interaction.user.username}`.slice(0, 90),
+      type: ChannelType.GuildText,
+      parent: TICKET_CATEGORY_ID || undefined,
+      topic: topicMarca,
+      permissionOverwrites: overwrites
+    });
+  } catch (err) {
+    console.error('[TICKETS] Error creando el canal:', err);
+    await interaction.editReply('No pude crear el canal del ticket. Avisale a un admin (puede faltar el permiso "Gestionar canales" o estar mal el ID de la categoría).');
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(cfg.title)
+    .setDescription(cfg.bienvenida)
+    .setColor(cfg.color);
+
+  const rowCerrar = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('close_ticket').setLabel('Cerrar ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+  );
+
+  await canal.send({ content: `${interaction.user}${STAFF_ROLE_ID ? ` <@&${STAFF_ROLE_ID}>` : ''}`, embeds: [embed], components: [rowCerrar] });
+  await interaction.editReply(`Ticket creado: ${canal}`);
+}
+
+async function cerrarTicket(interaction) {
+  const canal = interaction.channel;
+  const esTicket = canal?.topic?.startsWith('ticket:');
+  if (!esTicket) {
+    await interaction.reply({ content: 'Esto no es un canal de ticket.', ephemeral: true });
+    return;
+  }
+
+  const esDueño = canal.topic.endsWith(`:${interaction.user.id}`);
+  if (!esDueño && !esPersonalAutorizado(interaction.member)) {
+    await interaction.reply({ content: 'No tenés permiso para cerrar este ticket.', ephemeral: true });
+    return;
+  }
+
+  await interaction.reply('🔒 Cerrando este ticket en 5 segundos...');
+  setTimeout(() => {
+    canal.delete().catch(() => {});
+  }, 5000);
+}
+
+// Borra TODOS los mensajes de un canal. Discord solo permite el borrado
+// masivo (bulkDelete) para mensajes de menos de 14 días; los más viejos
+// hay que borrarlos uno por uno (más lento, con pausa para no chocar
+// contra el rate limit de la API).
+async function limpiarCanalCompleto(channel) {
+  let totalBorrados = 0;
+
+  while (true) {
+    const mensajes = await channel.messages.fetch({ limit: 100 });
+    if (mensajes.size === 0) break;
+
+    let borrados;
+    try {
+      borrados = await channel.bulkDelete(mensajes, true); // true = ignora los de +14 días en vez de tirar error
+    } catch (err) {
+      console.error('[CLEARCHAT] Error en bulkDelete:', err.message);
+      break;
+    }
+    totalBorrados += borrados.size;
+
+    if (borrados.size < mensajes.size) {
+      // Lo que quedó son mensajes de más de 14 días: solo se pueden borrar de a uno.
+      const viejos = mensajes.filter(m => !borrados.has(m.id));
+      for (const m of viejos.values()) {
+        try {
+          await m.delete();
+          totalBorrados++;
+          await new Promise(r => setTimeout(r, 1000));
+        } catch (e) {}
+      }
+    }
+
+    if (mensajes.size < 100) break; // ya no quedan más mensajes
+  }
+
+  return totalBorrados;
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
+
+client.once('ready', async () => {
+  console.log(`Conectado como ${client.user.tag}`);
+  await asegurarPanelesDeTickets();
 });
 
 // ---------- Servidor web (necesario para Render + UptimeRobot) ----------
@@ -54,6 +266,9 @@ const commands = [
     .setName('scanurl')
     .setDescription('Analiza un link con VirusTotal')
     .addStringOption(opt => opt.setName('url').setDescription('El link a analizar').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('clearchat')
+    .setDescription('Borra todos los mensajes de este canal (solo para el rol autorizado)'),
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -142,9 +357,7 @@ function buildEmbed(target, results) {
 // ---------- Eventos ----------
 
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === 'scanurl') {
+  if (interaction.isChatInputCommand() && interaction.commandName === 'scanurl') {
     const url = interaction.options.getString('url');
     await interaction.deferReply();
 
@@ -160,6 +373,31 @@ client.on('interactionCreate', async interaction => {
       const replyMsg = await interaction.fetchReply();
       programarAutoBorrado(replyMsg);
     } catch (e) {}
+    return;
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'clearchat') {
+    if (!interaction.member.roles.cache.has(CLEARCHAT_ROLE_ID)) {
+      await interaction.reply({ content: '⛔ No tenés permiso para usar este comando.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    const total = await limpiarCanalCompleto(interaction.channel);
+    await interaction.editReply(`🧹 Listo, borré ${total} mensajes de este canal.`);
+    return;
+  }
+
+  if (interaction.isButton()) {
+    if (interaction.customId.startsWith('open_ticket_')) {
+      const tipoKey = interaction.customId.replace('open_ticket_', '');
+      await abrirTicket(interaction, tipoKey);
+      return;
+    }
+    if (interaction.customId === 'close_ticket') {
+      await cerrarTicket(interaction);
+      return;
+    }
   }
 });
 
